@@ -1,0 +1,391 @@
+import os
+import numpy as np
+import pandas as pd
+import glob
+import re
+import torch
+from torch.utils.data import Dataset, DataLoader
+from utils.tools import inject_sensor_fault
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from utils.timefeatures import time_features
+from data_provider.m4 import M4Dataset, M4Meta
+from data_provider.uea import subsample, interpolate_missing, Normalizer
+from sktime.datasets import load_from_tsfile_to_dataframe
+import warnings
+from utils.augmentation import run_augmentation_single
+
+warnings.filterwarnings('ignore')
+
+class Dataset_ETT_hour(Dataset):
+    def __init__(self, args, root_path, flag='train', size=None,
+                 features='S', data_path='ETTh1.csv',
+                 target='OT', scale=True, timeenc=0, freq='h', seasonal_patterns=None):
+        # size [seq_len, label_len, pred_len]
+        self.args = args
+        # info
+        if size == None:
+            self.seq_len = 24 * 4 * 4
+            self.label_len = 24 * 4
+            self.pred_len = 24 * 4
+        else:
+            self.seq_len = size[0]
+            self.label_len = size[1]
+            self.pred_len = size[2]
+        # init
+        assert flag in ['train', 'test', 'val']
+        type_map = {'train': 0, 'val': 1, 'test': 2}
+        self.set_type = type_map[flag]
+
+        self.features = features
+        self.target = target
+        self.scale = scale
+        self.timeenc = timeenc
+        self.freq = freq
+
+        self.root_path = root_path
+        self.data_path = data_path
+        self.__read_data__()
+
+    def __read_data__(self):
+        self.scaler = StandardScaler()
+        df_raw = pd.read_csv(os.path.join(self.root_path,
+                                          self.data_path))
+
+        border1s = [0, 12 * 30 * 24 - self.seq_len, 12 * 30 * 24 + 4 * 30 * 24 - self.seq_len]
+        border2s = [12 * 30 * 24, 12 * 30 * 24 + 4 * 30 * 24, 12 * 30 * 24 + 8 * 30 * 24]
+        border1 = border1s[self.set_type]
+        border2 = border2s[self.set_type]
+
+        if self.features == 'M' or self.features == 'MS':
+            cols_data = df_raw.columns[1:]
+            df_data = df_raw[cols_data]
+        elif self.features == 'S':
+            df_data = df_raw[[self.target]]
+
+        if self.scale:
+            train_data = df_data[border1s[0]:border2s[0]]
+            self.scaler.fit(train_data.values)
+            data = self.scaler.transform(df_data.values)
+        else:
+            data = df_data.values
+
+        df_stamp = df_raw[['date']][border1:border2]
+        df_stamp['date'] = pd.to_datetime(df_stamp.date)
+        if self.timeenc == 0:
+            df_stamp['month'] = df_stamp.date.apply(lambda row: row.month, 1)
+            df_stamp['day'] = df_stamp.date.apply(lambda row: row.day, 1)
+            df_stamp['weekday'] = df_stamp.date.apply(lambda row: row.weekday(), 1)
+            df_stamp['hour'] = df_stamp.date.apply(lambda row: row.hour, 1)
+            data_stamp = df_stamp.drop(['date'], 1).values
+        elif self.timeenc == 1:
+            data_stamp = time_features(pd.to_datetime(df_stamp['date'].values), freq=self.freq)
+            data_stamp = data_stamp.transpose(1, 0) 
+
+        self.data_x = data[border1:border2]
+        self.data_y = data[border1:border2]
+
+        if self.set_type == 0 and self.args.augmentation_ratio > 0:
+            self.data_x, self.data_y, augmentation_tags = run_augmentation_single(self.data_x, self.data_y, self.args)
+
+        self.data_stamp = data_stamp
+
+    def __getitem__(self, index):
+        s_begin = index
+        s_end = s_begin + self.seq_len
+        r_begin = s_end - self.label_len
+        r_end = r_begin + self.label_len + self.pred_len
+
+        seq_x = self.data_x[s_begin:s_end]
+        seq_y = self.data_y[r_begin:r_end]
+        seq_x_mark = self.data_stamp[s_begin:s_end]
+        seq_y_mark = self.data_stamp[r_begin:r_end]
+
+        return seq_x, seq_y, seq_x_mark, seq_y_mark
+
+    def __len__(self):
+        return len(self.data_x) - self.seq_len - self.pred_len + 1
+
+    def inverse_transform(self, data):
+        return self.scaler.inverse_transform(data)
+
+class Z24loader(Dataset):
+    def __init__(self, args, root_path, flag='train', size=None,
+                 features='S', data_path='Z24.csv',
+                 target='', scale=True, timeenc=0, freq='h', seasonal_patterns=None):
+        self.args = args
+        self.seq_len = args.seq_len
+        self.label_len = 0
+        self.pred_len = args.seq_len
+        assert flag in ['train', 'test', 'val', 'test_health']
+        type_map = {'train': 0, 'val': 1, 'test_health': 2, 'test': 3}
+        self.set_type = type_map[flag]
+
+        self.features = features
+        self.target = target
+        self.scale = scale
+        self.timeenc = timeenc
+        self.freq = freq
+        self.root_path = root_path
+        self.data_path = data_path
+        self.flag = flag
+        self.env_columns = ['WS', 'WD', 'H', 'AT', 'TE']
+        
+        # Define data paths
+        self.train_data_path = 'data_six_months.parquet'
+        self.train_env_path = 'env_data_final.parquet'
+        self.test_health_data_path = 'data_test_health0.parquet'
+        self.test_damage_data_path = 'data_test_damage0.parquet'
+        self.test_env_path = 'data_test_env.parquet'
+        
+        # Initialize scaler
+        self.scaler = MinMaxScaler(feature_range=(-1, 1))
+        
+        # Path for saving scaler parameters
+        self.scaler_path = os.path.join(root_path, self.data_path, 'scaler_params.npz')
+        
+        self.__read_data__()
+
+    def __read_data__(self):
+        """Read and preprocess data based on flag."""
+        # 处理测试数据的情况 - 单独处理
+        if self.flag == 'test':
+            # 读取损伤测试数据
+            test_damage_data = pd.read_parquet(
+                os.path.join(self.root_path, self.data_path, self.test_damage_data_path),
+                columns=['datetime', self.args.sensors] if self.args.sensors != 'all' else None
+            ).fillna(0)
+            test_damage_data.set_index('datetime', inplace=True)
+            
+            # 加载scaler参数
+            if self.scale and os.path.exists(self.scaler_path):
+                scaler_params = np.load(self.scaler_path)
+                self.scaler.scale_ = scaler_params['scale_']
+                self.scaler.min_ = scaler_params['min_']
+                self.scaler.data_min_ = scaler_params['data_min_']
+                self.scaler.data_max_ = scaler_params['data_max_']
+                self.scaler.data_range_ = scaler_params['data_range_']
+                
+                self.data_x = self.scaler.transform(test_damage_data.values)
+            else:
+                self.data_x = test_damage_data.values
+                
+            self.timestamps = test_damage_data.index
+            
+            # 读取环境数据
+            test_env = pd.read_parquet(
+                os.path.join(self.root_path, self.data_path, self.test_env_path),
+                columns=self.env_columns
+            ).fillna(0)
+            self.data_env = test_env[test_env.index > pd.to_datetime('1998-08-01')]
+            
+            print(f"Test damage data loaded with shape: {self.data_x.shape}")
+            return
+        
+        # 处理训练、验证和健康测试数据 - 拼接并按月份划分
+        # 1. 读取训练数据和健康测试数据
+        if self.args.sensors != 'all':
+            train_data = pd.read_parquet(
+                os.path.join(self.root_path, self.data_path, self.train_data_path),
+                columns=['datetime', self.args.sensors]
+            ).fillna(0)
+            
+            test_health_data = pd.read_parquet(
+                os.path.join(self.root_path, self.data_path, self.test_health_data_path),
+                columns=['datetime', self.args.sensors]
+            ).fillna(0)
+        else:
+            train_data = pd.read_parquet(
+                os.path.join(self.root_path, self.data_path, self.train_data_path)
+            ).fillna(0)
+            
+            test_health_data = pd.read_parquet(
+                os.path.join(self.root_path, self.data_path, self.test_health_data_path)
+            ).fillna(0)
+        
+        # 2. 设置索引并合并数据
+        train_data.set_index('datetime', inplace=True)
+        test_health_data.set_index('datetime', inplace=True)
+        
+        # 合并数据集（健康数据）
+        combined_data = pd.concat([train_data, test_health_data])
+        combined_data = combined_data.sort_index()  # 确保按时间顺序
+        
+        # 3. 缩放处理
+        if self.scale:
+            if self.flag == 'train' or not os.path.exists(self.scaler_path):
+                # 使用所有健康数据拟合缩放器
+                self.scaler.fit(combined_data.values)
+                np.savez(self.scaler_path, 
+                        scale_=self.scaler.scale_,
+                        min_=self.scaler.min_,
+                        data_min_=self.scaler.data_min_,
+                        data_max_=self.scaler.data_max_,
+                        data_range_=self.scaler.data_range_)
+            else:
+                # 加载已保存的缩放器参数
+                scaler_params = np.load(self.scaler_path)
+                self.scaler.scale_ = scaler_params['scale_']
+                self.scaler.min_ = scaler_params['min_']
+                self.scaler.data_min_ = scaler_params['data_min_']
+                self.scaler.data_max_ = scaler_params['data_max_']
+                self.scaler.data_range_ = scaler_params['data_range_']
+        
+        # 4. 读取环境数据
+        train_env = pd.read_parquet(
+            os.path.join(self.root_path, self.data_path, self.train_env_path),
+            columns=self.env_columns
+        ).fillna(0)
+        
+        test_env = pd.read_parquet(
+            os.path.join(self.root_path, self.data_path, self.test_env_path),
+            columns=self.env_columns
+        ).fillna(0)
+        
+        # 只获取健康测试环境数据
+        test_env_health = test_env[test_env.index < pd.to_datetime('1998-08-01')]
+        combined_env = pd.concat([train_env, test_env_health]).sort_index()
+        
+        # 5. 将环境数据与传感器数据对齐
+        aligned_env_data = []
+        for ts in combined_data.index:
+            # 找到最接近的时间戳
+            closest_timestamp = pd.Timestamp(ts).floor('H')  # 向下取整到小时
+            
+            # 找到最接近的可用时间戳
+            available_timestamps = combined_env.index
+            closest_idx = available_timestamps.searchsorted(closest_timestamp)
+            if closest_idx >= len(available_timestamps):
+                closest_idx = len(available_timestamps) - 1
+            closest_available = available_timestamps[closest_idx]
+            env_row = combined_env.loc[closest_available].to_dict()
+            
+            # 添加时间戳作为索引
+            env_row['timestamp'] = ts
+            env_row['month'] = ts.month
+            env_row['year'] = ts.year
+            aligned_env_data.append(env_row)
+        
+        # 创建对齐的环境数据DataFrame
+        aligned_env_df = pd.DataFrame(aligned_env_data)
+        aligned_env_df.set_index('timestamp', inplace=True)
+        
+        # 6. 按月分组划分数据
+        combined_data['month'] = combined_data.index.month
+        combined_data['year'] = combined_data.index.year
+        
+        # 按年月分组 - 传感器数据和环境数据都按相同方式分组
+        monthly_groups = combined_data.groupby(['year', 'month'])
+        monthly_env_groups = aligned_env_df.groupby(['year', 'month'])
+        
+        train_data_list = []
+        val_data_list = []
+        test_health_data_list = []
+        
+        train_env_list = []
+        val_env_list = []
+        test_health_env_list = []
+        
+        # 对每个月的数据进行分割：70% 训练, 15% 验证, 15% 测试健康
+        for (year, month), group in monthly_groups:
+            # 移除年月列
+            group = group.drop(['month', 'year'], axis=1)
+            
+            # 获取相应月份的环境数据
+            try:
+                env_group = monthly_env_groups.get_group((year, month))
+                env_group = env_group.drop(['month', 'year'], axis=1)
+                
+                # 确保索引完全匹配
+                common_indices = group.index.intersection(env_group.index)
+                if len(common_indices) < len(group):
+                    print(f"警告: {year}年{month}月有{len(group) - len(common_indices)}个传感器数据点没有对应的环境数据")
+                
+                # 使用共同索引
+                group = group.loc[common_indices]
+                env_group = env_group.loc[common_indices]
+            except KeyError:
+                print(f"警告: 找不到{year}年{month}月的环境数据，跳过此月")
+                continue
+            
+            # 分割数据
+            n = len(group)
+            train_end = int(n * 0.7)
+            val_end = int(n * 0.85)
+            
+            # 分割传感器数据
+            train_data_list.append(group.iloc[:train_end])
+            val_data_list.append(group.iloc[train_end:val_end])
+            test_health_data_list.append(group.iloc[val_end:])
+            
+            # 按照完全相同的方式分割环境数据
+            train_env_list.append(env_group.iloc[:train_end])
+            val_env_list.append(env_group.iloc[train_end:val_end])
+            test_health_env_list.append(env_group.iloc[val_end:])
+        
+        # 合并各月数据为相应的数据集
+        split_train = pd.concat(train_data_list).sort_index()
+        split_val = pd.concat(val_data_list).sort_index()
+        split_test_health = pd.concat(test_health_data_list).sort_index()
+        
+        # 合并环境数据
+        split_train_env = pd.concat(train_env_list).sort_index()
+        split_val_env = pd.concat(val_env_list).sort_index()
+        split_test_health_env = pd.concat(test_health_env_list).sort_index()
+        
+        # 根据flag选择适当的数据
+        if self.flag == 'train':
+            selected_data = split_train
+            selected_env = split_train_env
+        elif self.flag == 'val':
+            selected_data = split_val
+            selected_env = split_val_env
+        elif self.flag == 'test_health':
+            selected_data = split_test_health
+            selected_env = split_test_health_env
+        
+        # 应用缩放并设置数据
+        self.data_x = self.scaler.transform(selected_data.values) if self.scale else selected_data.values
+        self.timestamps = selected_data.index
+        
+        # 直接使用对应的环境数据
+        self.data_env = selected_env
+        
+        print(f"Data loaded for '{self.flag}', shape: {self.data_x.shape}")
+        print(f"Environment data shape: {self.data_env.shape}")
+        print(f"Time range: {self.timestamps.min()} to {self.timestamps.max()}")
+
+    def __getitem__(self, index):
+        s_begin = index * self.seq_len  # 计算批次的起始位置
+        s_end = s_begin + self.seq_len  # 计算批次的结束位置
+
+        # 确保索引不超出范围
+        if s_end > len(self.data_x):
+            s_begin = len(self.data_x) - self.seq_len
+            s_end = len(self.data_x)
+        
+        seq_x = self.data_x[s_begin:s_end]
+        
+        # 使用对应时间戳获取环境数据
+        current_timestamp = self.timestamps[s_begin]
+        
+        # 由于已经在数据加载时对齐了环境数据，这里直接获取对应索引的环境数据
+        seq_env = torch.FloatTensor(self.data_env.loc[current_timestamp].values)
+        
+        # 将时间戳转换为数值特征
+        timestamps = self.timestamps[s_begin:s_end]
+        time_features = np.stack([
+            timestamps.hour,
+            timestamps.day,
+            timestamps.dayofweek,
+            timestamps.month,
+        ], axis=1).astype(np.float32)
+        seq_x_mark = torch.FloatTensor(time_features)
+        seq_y_mark = torch.FloatTensor(timestamps.astype(np.int64).values) 
+        return seq_x, seq_env, seq_x_mark, seq_y_mark # 返回的是 数据、环境、时间特征、时间戳
+
+
+    def __len__(self):
+        return len(self.data_x) // self.seq_len
+
+    def inverse_transform(self, data):
+        return self.scaler.inverse_transform(data)

@@ -1,0 +1,899 @@
+from data_provider.data_factory import data_provider
+from exp.exp_basic import Exp_Basic
+from utils.tools import EarlyStopping, adjust_learning_rate, visual, inject_sensor_fault, diversity_loss, result_save, plot_loss, percentile_cal, plot_show, loss_save, Bridge_Loss, Bridge_Loss_Vali, MoE
+import torch
+import torch.nn as nn
+from torch import optim
+import os
+import time
+import warnings
+import numpy as np
+import pandas as pd
+from torch import Tensor
+import matplotlib.pyplot as plt
+import seaborn as sns
+import torch.nn.functional as F
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from scipy.spatial import ConvexHull
+
+warnings.filterwarnings('ignore')
+
+
+
+
+class Exp_Imputation_bridge(Exp_Basic):
+    def __init__(self, args):
+        super(Exp_Imputation_bridge, self).__init__(args)
+        self.fault_config = {
+            'normal': 0.7,
+            'missing': 0.07,
+            'minor': 0.05,
+            'square': 0.05,
+            'trend': 0.05,
+            'spike': 0.05,
+            'outlier': 0.03,
+        }
+        self.div = 0.2
+        self.loss_mode = args.loss_mode
+
+    def _build_model(self):
+        # 在创建模型前设置参数
+        self.args.num_sensors = 8  # 传感器数量
+        self.args.num_env_sensors = 5  # 环境传感器数量
+        self.args.num_wavelets_scales = 3  # 小波尺度数量
+        self.args.pooled_points = 384  # 池化点数
+
+        model = self.model_dict[self.args.model].Model(self.args).float()
+
+        if self.args.use_multi_gpu and self.args.use_gpu:
+            model = nn.DataParallel(model, device_ids=self.args.device_ids)
+        return model
+
+    def _get_data(self, flag):
+        data_set, data_loader = data_provider(self.args, flag)
+        return data_set, data_loader
+    
+    def _select_optimizer(self):
+        model_optim = optim.Adam(self.model.parameters(), lr=self.args.learning_rate)
+        return model_optim
+
+    def _select_criterion(self, loss_mode):
+        # criterion = nn.MSELoss()
+        criterion = Bridge_Loss(loss_mode)
+        return criterion
+    
+    def select_criterion_vali(self, di_mode):
+        criterion = Bridge_Loss_Vali(di_mode)
+        return criterion 
+    
+
+
+    def vali(self, vali_data, vali_loader, criterion, path):
+
+        total_loss = []
+        preds = []
+        trues = []
+        data_stamps = []
+        self.model.eval()
+        with torch.no_grad():
+            for i, (x, batch_env, batch_x_mark, batch_y_mark) in enumerate(vali_loader):
+                x = x.float().to(self.device)
+                batch_x_mark = batch_x_mark.float().to(self.device)
+                batch_env = batch_env.float().to(self.device)
+
+                batch_x = x
+                # random mask
+                B, S, T, N = batch_x.shape
+                """
+                B = batch size
+                T = seq len
+                N = number of features
+                """
+                mask = torch.rand((B, S, T, N)).to(self.device)
+                mask[mask <= self.args.mask_rate] = 0  # masked
+                mask[mask > self.args.mask_rate] = 1  # remained
+                # inp = batch_x.masked_fill(mask == 0, 0)
+                inp = batch_x
+
+                # outputs,attn = self.model(inp, batch_x_mark, None, None, mask) ##transformer系列的输出
+                outputs = self.model(batch_x, batch_x_mark, None, None, mask, batch_env)
+
+                # f_dim = -1 if self.args.features == 'MS' else 0
+                # outputs = outputs[:, :, f_dim:]
+
+                # # add support for MS
+                # batch_x = batch_x[:, :, f_dim:]
+                # mask = mask[:, :, f_dim:]
+
+                pred = outputs.cpu()
+                true = x.cpu()
+                mask = mask.cpu()
+
+                loss = criterion(pred.reshape(B,S*T,N), true.reshape(B,S*T,N))
+                total_loss.append(loss)
+                time_stamp = batch_y_mark
+                data_stamp = pd.to_datetime(time_stamp[:,0].cpu().numpy(), unit='ns')
+                data_stamps.append(data_stamp)
+                preds.append(pred.reshape(B,S*T,N))
+                trues.append(true.reshape(B,S*T,N))
+
+                if (i + 1) % 200 == 0:
+                    print("\titers: {0} | loss: {1:.7f}".format(i + 1, loss.mean().item()))
+
+            preds = torch.cat(preds,dim = 0)
+            trues = torch.cat(trues, dim = 0)
+            total_loss = torch.cat(total_loss, dim=0)
+            data_stamps = np.concatenate([ds.to_numpy() for ds in data_stamps])
+            timestamps = pd.Series(data_stamps.astype(int))
+            # visual(trues, preds, path)
+            # print('true_pred_comparation_plot done!')                
+        # total_loss_avg = torch.stack(total_loss, dim=0) 
+        # total_loss_avg = total_loss_avg.mean(dim=0)  
+        # total_loss_std = torch.Tensor(np.std(total_loss,axis=0))
+        # total_loss =  torch.Tensor(np.average(total_loss))
+            #if path is not None:
+                #result_save(trues, preds, path, labels = None, losses = total_loss, timestamps = timestamps, flag='vali')
+        self.model.train()
+        return total_loss
+    def train(self, setting):
+        train_data, train_loader = self._get_data(flag='train')
+        val_data, val_loader = self._get_data(flag='val')
+        test_data, test_loader = self._get_data(flag='test')
+        test_health_data, test_health_loader = self._get_data(flag='test_health')
+        
+        path = os.path.join(self.args.checkpoints, setting)
+        if not os.path.exists(path):
+            os.makedirs(path)
+        path_train = os.path.join(self.args.train_loss_comparation, setting)
+        if not os.path.exists(path_train):
+            os.makedirs(path_train)
+        path_vali_loss_save = os.path.join(self.args.loss_save, setting, 'vali')
+        if not os.path.exists(path_vali_loss_save):
+            os.makedirs(path_vali_loss_save)
+            
+        # 创建注意力权重和潜在特征保存目录
+        attn_weights_path = os.path.join(self.args.loss_save, setting, 'attention_weights','train',)
+        latent_features_path = os.path.join(self.args.loss_save, setting, 'latent_features','train')
+        os.makedirs(attn_weights_path, exist_ok=True)
+        os.makedirs(latent_features_path, exist_ok=True)
+
+        time_now = time.time()
+        train_steps = len(train_loader)
+        early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
+        model_optim = self._select_optimizer()
+        criterion = self._select_criterion(self.args.loss_mode)
+        criterion_vali = self.select_criterion_vali(self.args.di_mode)
+
+        epoch_train_mean = []
+        epoch_vali_mean = []
+        epoch_test_health_mean = []
+        epoch_test_mean = []
+        
+        epoch_train_std = []
+        epoch_vali_std = []
+        # epoch_test_health_std = []
+        # epoch_test_std = []
+        
+        # 温度分箱参数
+        # temp_range = (-10, 30, 5)
+        # min_temp, max_temp, step = temp_range
+        # temp_bins = [(t, t + step) for t in range(min_temp, max_temp, step)]
+        # samples_per_bin = 100
+        
+        # # 收集数据的数据结构 - 只保留训练数据
+        # train_binned_data = {i: {'data': [], 'temp': [], 'attn': [], 'features': [], 
+        #                       'humidity': [], 'wind_speed': [], 'wind_direction': [], 
+        #                       'thermal_exp': []} for i in range(len(temp_bins))}
+        
+        # # 已完成的温度区间 - 只保留训练数据
+        # completed_bins = {'train': set()}
+        
+        # # 全局特征数据 - 只保留训练数据
+        # global_features = {'train': []}
+        # global_temps = {'train': []}
+        # global_hums = {'train': []}
+        # global_labels = {'train': []}
+        
+        # # 是否是最后一轮的标志
+        # is_final_epoch = False
+
+        for epoch in range(self.args.train_epochs):
+            iter_count = 0
+            train_loss = []
+
+            self.model.train()
+            epoch_time = time.time()
+            
+            # 检查是否是最后一轮（达到最大轮次或即将触发早停）
+            # if epoch == self.args.train_epochs - 1 or (early_stopping.counter == self.args.patience - 1 and epoch > 0):
+            #     is_final_epoch = True
+            #     print(f"Final epoch detected ({epoch+1}). Will collect attention weights during training.")
+            
+            for i, (x,  batch_y, batch_x_mark, batch_y_mark) in enumerate(train_loader):
+                # if batch_x.sum() == 0:
+                #     continue
+                iter_count += 1
+                model_optim.zero_grad()
+
+                x = x.float().to(self.device)
+                batch_x_mark = batch_x_mark.float().to(self.device)
+                batch_env = batch_y.float().to(self.device) if batch_y is not None else None
+                # batch_x = inject_sensor_fault(x_time,
+                #                             self.fault_config,
+                #                             self.device
+                #                         )
+                # imputation origin data without noise
+                batch_x = x
+                B, S, T, N = batch_x.shape
+                mask = torch.rand((B, S, T, N)).to(self.device)
+                mask[mask <= self.args.mask_rate] = 0  # masked
+                mask[mask > self.args.mask_rate] = 1  # remained
+                inp = batch_x.masked_fill(mask == 0, 0)
+
+                # # 在最后一轮收集注意力和特征
+                # if is_final_epoch:
+                #     # 使用forward_with_attention获取注意力权重和隐藏特征
+                #     outputs, hidden_states, attention_weights = self.model.forward_with_attention(
+                #         batch_x, batch_x_mark, None, None, mask, batch_env
+                #     )
+                    
+
+                #     temps = batch_env[:, 3].cpu().numpy()  # 温度 AT (索引3)
+                #     humidity = batch_env[:, 2].cpu().numpy()  # 湿度 H (索引2)
+                #     wind_speed = batch_env[:, 0].cpu().numpy()  # 风速 WS (索引0)
+                #     wind_direction = batch_env[:, 1].cpu().numpy()  # 风向 WD (索引1)
+                #     thermal_exp = batch_env[:, 4].cpu().numpy() if batch_env.shape[1] > 4 else np.zeros_like(temps)  # 热膨胀 TE (索引4)
+
+                #     # 获取平均隐藏特征（按时间维度平均）
+                #     # avg_features = hidden_states.mean(dim=1).cpu()
+                    
+                #     # 添加到全局数据
+                #     global_features['train'].append(hidden_states['fused'])
+                #     global_temps['train'].extend(temps)
+                #     global_hums['train'].extend(humidity)
+                #     global_labels['train'].extend(['train'] * len(temps))
+                    
+                #     # 处理温度分箱
+                #     for j, temp in enumerate(temps):
+                #         # 找到对应温度的箱
+                #         bin_idx = None
+                #         for k, (bin_min, bin_max) in enumerate(temp_bins):
+                #             if bin_min <= temp < bin_max:
+                #                 bin_idx = k
+                #                 break
+                        
+                #         # 如果找到对应箱且箱未满，收集样本
+                #         if bin_idx is not None and bin_idx not in completed_bins['train']:
+                #             if len(train_binned_data[bin_idx]['data']) < samples_per_bin:
+                #                 # 收集样本数据
+                #                 train_binned_data[bin_idx]['data'].append(batch_x[j:j+1].cpu())
+                #                 train_binned_data[bin_idx]['temp'].append(temp)
+                #                 train_binned_data[bin_idx]['humidity'].append(humidity[j])
+                #                 train_binned_data[bin_idx]['wind_speed'].append(wind_speed[j])
+                #                 train_binned_data[bin_idx]['wind_direction'].append(wind_direction[j])
+                #                 train_binned_data[bin_idx]['thermal_exp'].append(thermal_exp[j])
+                                
+                #                 # 收集注意力权重
+                #                 if isinstance(attention_weights, dict):
+                #                     # 字典类型的注意力权重
+                #                     attn_dict = {}
+                #                     for attn_type, attn_val in attention_weights.items():
+                #                         if attn_val is not None:
+                #                             attn_dict[attn_type] = attn_val[j:j+1].cpu()
+                #                     train_binned_data[bin_idx]['attn'].append(attn_dict)
+                #                 else:
+                #                     # 张量类型的注意力权重
+                #                     train_binned_data[bin_idx]['attn'].append(attention_weights[j:j+1].cpu())
+                                
+                #                 # 收集隐藏特征
+                #                 # train_binned_data[bin_idx]['features'].append(hidden_states['fused'][j:j+1])
+                                
+                #                 # 检查箱是否已满
+                #                 if len(train_binned_data[bin_idx]['data']) >= samples_per_bin:
+                #                     completed_bins['train'].add(bin_idx)
+                # else:
+                # 正常训练过程
+                outputs, hidden_states, attention_weights = self.model.forward_with_attention(batch_x, batch_x_mark, None, None, mask, batch_env)
+                loss = criterion(outputs.reshape(B, S*T, N), batch_x.reshape(B, S*T, N)) # 输入最好是(batch_size, time_steps, sensor_type) 输出就是(sensor_type) #  对比的是原始的x和重构输出的x
+                train_loss.append(loss) 
+
+                if (i + 1) % 200 == 0:
+                    print("\titers: {0}, epoch: {1} | loss: {2:.7f}".format(i + 1, epoch + 1, loss.mean().item()))
+                    speed = (time.time() - time_now) / iter_count
+                    left_time = speed * ((self.args.train_epochs - epoch) * train_steps - i)
+                    print('\tspeed: {:.4f}s/iter; left time: {:.4f}s'.format(speed, left_time))
+                    iter_count = 0
+                    
+                loss.mean().backward() # 针对多变量的情况,做平均loss的下降
+                model_optim.step()
+            train_loss = torch.stack(train_loss, dim=0)
+            train_loss_mean, train_loss_std = percentile_cal(train_loss,per_num = 90)
+            epoch_train_mean.append(train_loss_mean)
+            epoch_train_std.append(train_loss_std)
+            print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
+
+            # # p_t = time.time()
+            # print("start validate!")
+            # vali_loss = self.vali(vali_data, vali_loader, criterion_vali, path_vali_loss_save) ## 返回一个列表(sample_length, feature_nums)
+
+            # vali_loss_mean, vali_loss_std = percentile_cal(vali_loss, per_num = 90)
+            # epoch_vali_mean.append(vali_loss_mean)
+            # epoch_vali_std.append(vali_loss_std)
+
+            # print("Epoch: {0}, Steps: {1} | Train Loss mean : {2} Vali Loss mean: {3}, Vali loss percentile 90 : {4} ".format(
+            #     epoch + 1, train_steps, train_loss_mean, vali_loss_mean, vali_loss_std))
+
+            # self.vali_loss_mean, self.vali_loss_std = early_stopping(vali_loss_mean, vali_loss_std, self.model, path, vali_loss)
+            
+            # # 如果是最后一轮，只收集训练数据
+            # if is_final_epoch:
+            #     print(f"Collecting training data in final epoch...")
+                
+            #     # 保存所有收集的训练数据
+            #     print("Saving collected attention weights and features...")
+                
+            #     # 只保存训练数据 - 修改为使用类方法
+            #     self.save_binned_data(train_binned_data, 'train', temp_bins, attn_weights_path)
+                
+            #     # 保存全局训练数据
+            #     if global_features['train']:
+            #         # 合并特征
+            #         features_tensor = torch.cat(global_features['train'], dim=0)
+                    
+            #         global_save_data = {
+            #             'features': features_tensor,
+            #             'temperature': np.array(global_temps['train']),
+            #             'humidity': np.array(global_hums['train']),
+            #             'dataset_type': 'train',
+            #             'labels': global_labels['train']
+            #         }
+                    
+            #         global_feature_path = os.path.join(latent_features_path, 'global_train_features.pt')
+            #         torch.save(global_save_data, global_feature_path)
+                
+            #     # 不进行可视化，只收集数据
+            #     print("Training data collection completed at epoch {}!".format(epoch+1))
+
+            print("start validate!")
+            vali_loss = self.vali(val_data, val_loader, criterion_vali, path_vali_loss_save) ## 返回一个列表(sample_length, feature_nums)
+
+            vali_loss_mean, vali_loss_std = percentile_cal(vali_loss, per_num = 90)
+            epoch_vali_mean.append(vali_loss_mean)
+            epoch_vali_std.append(vali_loss_std)
+
+            print("Epoch: {0}, Steps: {1} | Train Loss mean : {2} Vali Loss mean: {3}, Vali loss percentile 90 : {4} ".format(
+                epoch + 1, train_steps, train_loss_mean, vali_loss_mean, vali_loss_std))
+
+            self.vali_loss_mean, self.vali_loss_std = early_stopping(vali_loss_mean, vali_loss_std, self.model, path, vali_loss)
+            
+            # 恢复训练模式
+            self.model.train()
+            
+            if early_stopping.early_stop:
+                print("Early stopping")
+
+                break
+
+            adjust_learning_rate(model_optim, epoch + 1, self.args)
+        plot_loss(epoch_train_std, epoch_vali_std, None, None, path_train, self.args.patience, loss_type='mean')
+        plot_loss(epoch_train_std, epoch_vali_std, None, None, path_train, self.args.patience, loss_type='std')
+        
+        # plot_loss(None, None, epoch_test_health_std, epoch_test_std, path_train, self.args.patience, loss_type='mean')
+        # plot_loss(None, None,  epoch_test_health_std, epoch_test_std, path_train,self.args.patience, loss_type='std')
+        print("epoch train vali loss plotted!")
+
+        best_model_path = path + '/' + 'checkpoint.pth'
+        checkpoint = torch.load(best_model_path)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        # print('train done! start visualizing features...')
+
+        # # 创建t-SNE可视化保存目录
+        # tsne_save_path = os.path.join(path_train, 'tsne_visualization')
+        # os.makedirs(tsne_save_path, exist_ok=True)
+
+        # # 使用训练集和验证集进行特征可视化
+        # print('Generating t-SNE visualization of training features...')
+        # self.visualize_latent_space(
+        #     health_loader=train_loader,  # 使用训练集数据
+        #     damage_loader=None,  # 训练时没有损伤数据
+        #     save_path=tsne_save_path,
+        #     temp_bins=[(0, 5), (5, 10), (10, 15)],  # 根据实际温度范围调整
+        #     hum_bins=[(0, 0.4), (0.4, 0.7), (0.7, 1.0)]  # 根据实际湿度范围调整
+        # )
+
+        print('start test')
+        self.test(setting, 
+                  flag_one = 'vali', flag_two = None,
+                  healthy_data = val_data, healthy_loader = val_loader, 
+                  damaged_data =  None, damaged_loader = None, 
+                  test = 1, 
+                  vali_loss = early_stopping.best_vali,  path_train = path_train)
+        self.test(setting, 
+                  flag_one = 'test_health', flag_two = 'test',
+                  healthy_data = test_health_data, healthy_loader = test_health_loader, 
+                  damaged_data =  test_data, damaged_loader = test_loader, 
+                  test = 1, 
+                  vali_loss = early_stopping.best_vali,  path_train = path_train)
+
+    def test(self, setting, flag_one, flag_two = None, healthy_data = None, healthy_loader = None,  damaged_data = None, damaged_loader = None, test = 0, vali_loss = None, path_train = None):
+
+        path_loss_save = os.path.join(self.args.loss_save, setting, flag_one) # 分训练、验证、测试健康、测试四种
+        if not os.path.exists(path_loss_save):
+            os.makedirs(path_loss_save)
+        # path_box_plot = os.path.join(path_loss_save,'box_plot')
+        # if not os.path.exists(path_box_plot):
+        #     os.makedirs(path_box_plot)
+        # if test_data is None or test_loader is None:
+        #     test_data, test_loader = self._get_data(flag = flag_one)
+        criterion = self.select_criterion_vali(self.args.di_mode)
+        if test:
+            print('loading model')
+            path = os.path.join(self.args.checkpoints, setting , 'checkpoint.pth')
+            checkpoint = torch.load(path)
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.vali_loss = checkpoint['val_loss']
+            self.vali_std = checkpoint['val_std']
+            print('loaded successfully!')
+        else:
+            self.vali_loss = self.vali_loss_mean
+            self.vali_std = self.vali_loss_std
+        anomaly_threshold = self.vali_std 
+        
+        temp_range = (-10, 30, 5)
+        min_temp, max_temp, step = temp_range
+        temp_bins = [(t, t + step) for t in range(min_temp, max_temp, step)]
+        samples_per_bin = 100
+        
+        
+        if flag_one == 'vali':
+            print('>>>>>>>validating data: {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
+            total_loss = []
+            preds = []
+            trues = []
+            data_stamps = []
+            
+            # 添加全局特征收集
+            global_features_vali = []
+            global_temps_vali = []
+            global_hums_vali = []
+            global_labels_vali = []
+            
+            # 初始化温度分箱数据
+            temp_binned_data = {i: {'data': [], 'temp': [], 'attn': [], 'features': []} for i in range(len(temp_bins))}
+            completed_bins = set()
+            
+            self.model.eval()
+            with torch.no_grad():
+                for i, (x, batch_y, batch_x_mark, batch_y_mark) in enumerate(healthy_loader):
+                    x = x.float().to(self.device)
+                    batch_x_mark = batch_x_mark.float().to(self.device)
+                    batch_env = batch_y.float().to(self.device)
+                    batch_x = x
+
+                    
+                    # 随机掩码
+                    B,S, T, N = batch_x.shape
+                    mask = torch.rand((B, S, T, N)).to(self.device)
+                    mask[mask <= self.args.mask_rate] = 0  # masked
+                    mask[mask > self.args.mask_rate] = 1  # remained
+                    inp = batch_x
+
+                    # 获取输出、隐藏特征和注意力权重
+                    outputs, hidden_states, attention_weights = self.model.forward_with_attention(batch_x, batch_x_mark, None, None, mask, batch_env)
+
+                    # f_dim = -1 if self.args.features == 'MS' else 0
+                    # outputs = outputs[:, :, f_dim:]
+
+                    # # add support for MS
+                    # batch_x = batch_x[:, :, f_dim:]
+                    # mask = mask[:, :, f_dim:]
+
+                    # 计算损失和收集常规评估数据
+                    pred = outputs.cpu()
+                    true = batch_x.cpu()
+                    mask = mask.cpu()
+
+                    loss = criterion(pred, true.reshape(B,S*T,N))
+                    total_loss.append(loss)
+                    time_stamp = batch_y_mark
+                    data_stamp = pd.to_datetime(time_stamp[:,0].cpu().numpy(), unit='ns')
+                    data_stamps.append(data_stamp)
+                    preds.append(pred.reshape(B,S*T,N))
+                    trues.append(true.reshape(B,S*T,N))
+                    
+                    # 在同一次遍历中处理温度分箱
+                    # 假设环境数据的第3个特征是空气温度（AT）
+                    if hasattr(self.args, 'use_env') and self.args.use_env:
+                        # 如果有环境数据
+                        temps = batch_x_mark[:, 3].cpu().numpy()  # 使用气温AT (index 3)
+                        humidity = batch_env[:, 2].cpu().numpy()  # 湿度 H (索引2)
+                        for j, temp in enumerate(temps):
+                            # 找到对应温度的箱
+                            bin_idx = None
+                            for k, (bin_min, bin_max) in enumerate(temp_bins):
+                                if bin_min <= temp < bin_max:
+                                    bin_idx = k
+                                    break
+                            
+                            # 如果找到对应箱且箱未满，则收集样本
+                            if bin_idx is not None and bin_idx not in completed_bins:
+                                if len(temp_binned_data[bin_idx]['data']) < samples_per_bin:
+                                    # 收集样本数据（这些都是已计算的，不需要重新运行模型）
+                                    temp_binned_data[bin_idx]['data'].append(batch_x[j:j+1].detach().cpu())
+                                    temp_binned_data[bin_idx]['temp'].append(temp)
+                                    if attention_weights is not None:
+                                        # 假设attention_weights的维度适合直接索引
+                                        temp_binned_data[bin_idx]['attn'].append(attention_weights[j:j+1].detach().cpu())
+                                    if hidden_states is not None:
+                                        temp_binned_data[bin_idx]['features'].append(hidden_states[j:j+1].detach().cpu())
+                                    
+                                    # 检查箱是否已满
+                                    if len(temp_binned_data[bin_idx]['data']) >= samples_per_bin:
+                                        completed_bins.add(bin_idx)
+
+                    # 收集全局特征
+                    global_features_vali.append(hidden_states['fused'].cpu())
+                    global_temps_vali.extend(temps)
+                    global_hums_vali.extend(humidity)
+                    global_labels_vali.extend(['vali'] * len(temps))
+
+                    if (i + 1) % 200 == 0:
+                        print("\titers: {0} | loss: {1:.7f}".format(i + 1, loss.mean().item()))
+
+                # 合并所有数据
+                preds = torch.cat(preds,dim = 0)
+                trues = torch.cat(trues, dim = 0)
+                total_loss = torch.cat(total_loss, dim=0)
+                data_stamps = np.concatenate([ds.to_numpy() for ds in data_stamps])
+                timestamps = pd.Series(data_stamps.astype(int))
+                
+                # 保存结果
+                result_save(trues, preds, path_loss_save, labels = None, losses = total_loss, timestamps = timestamps, flag='vali', moe_weight = None)
+                
+                # 处理和保存收集的温度分箱数据
+                attn_save_path = os.path.join(path_loss_save, 'attention_weights')
+                features_save_path = os.path.join(path_loss_save, 'latent_features')
+                os.makedirs(attn_save_path, exist_ok=True)
+                os.makedirs(features_save_path, exist_ok=True)
+                global_feature_path = os.path.join(features_save_path, 'global_vali_features.pt')
+
+                # 使用类方法保存数据
+                self.save_binned_data(temp_binned_data, 'vali', temp_bins, attn_save_path)
+
+                # 收集全局特征
+                global_features_vali = torch.cat(global_features_vali, dim=0)
+                global_temps_vali = np.array(global_temps_vali)
+                global_hums_vali = np.array(global_hums_vali)
+                global_labels_vali = np.array(global_labels_vali)
+
+                # 保存全局特征
+                global_save_data = {
+                    'features': global_features_vali,
+                    'temperature': global_temps_vali,
+                    'humidity': global_hums_vali,
+                    'dataset_type': 'vali',
+                    'labels': global_labels_vali
+                }
+                torch.save(global_save_data, global_feature_path)
+
+        elif flag_one == 'test_health':
+            print('>>>>>>>testing health data: {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
+            preds = []
+            trues = []
+            masks = []
+            labels = []
+            losses = []
+            data_stamps = []
+            
+            # 添加全局特征收集
+            global_features_test_health = []
+            global_temps_test_health = []
+            global_hums_test_health = []
+            global_labels_test_health = []
+            
+            # 初始化温度分箱数据
+            temp_binned_data_health = {i: {'data': [], 'temp': [], 'attn': [], 'features': []} for i in range(len(temp_bins))}
+            completed_bins_health = set()
+
+            self.model.eval()
+            with torch.no_grad():
+                for i, (x, batch_y, batch_x_mark, batch_y_mark) in enumerate(healthy_loader):
+                    x = x.float().to(self.device)
+                    batch_x_mark = batch_x_mark.float().to(self.device)
+                    batch_env = batch_y.float().to(self.device)
+
+                    # random mask
+                    B, T, N = x.shape
+                    mask = torch.rand((B, T, N)).to(self.device)
+                    mask[mask <= self.args.mask_rate] = 0  # masked
+                    mask[mask > self.args.mask_rate] = 1  # remained
+                    batch_x = x
+                    
+                    # 获取输出、隐藏特征和注意力权重
+                    outputs, hidden_states, attention_weights = self.model.forward_with_attention(batch_x, batch_x_mark, None, None, mask, batch_env)
+                    moe_weights_health = None
+
+                    # # eval
+                    # f_dim = -1 if self.args.features == 'MS' else 0
+                    # outputs = outputs[:, :, f_dim:]
+
+                    # # add support for MS 
+                    # batch_x = batch_x[:, :, f_dim:]
+                    # mask = mask[:, :, f_dim:]
+                    
+                    # 计算损失和异常检测
+                    loss = criterion(outputs.reshape(B,S*T,N), x.reshape(B,S*T,N))
+                    sample_labels = loss > torch.Tensor(anomaly_threshold).to(self.device)  # 异常标签：1，正常标签：0
+                    # loss = self.detect_anomaly(batch_x)
+                    # sample_labels = loss > anomaly_threshold
+
+                    # 收集常规评估数据
+                    labels.append(sample_labels)
+                    time_stamp = batch_y_mark
+                    data_stamp = pd.to_datetime(time_stamp[:,0].cpu().numpy(), unit='ns')
+                    masks.append(mask.detach().cpu())
+                    data_stamps.append(data_stamp)
+                    preds.append(outputs.reshape(B,S*T,N).detach().cpu())
+                    trues.append(batch_x.reshape(B,S*T,N).detach().cpu())
+                    losses.append(loss.detach())
+
+                    # 在同一次遍历中处理温度分箱
+                    if hasattr(self.args, 'use_env') and self.args.use_env:
+                        # 使用环境数据中的气温（AT，index 3）
+                        temps = batch_x_mark[:, 3].cpu().numpy()
+                        humidity = batch_env[:, 2].cpu().numpy()
+                        for j, temp in enumerate(temps):
+                            # 找到对应温度的箱
+                            bin_idx = None
+                            for k, (bin_min, bin_max) in enumerate(temp_bins):
+                                if bin_min <= temp < bin_max:
+                                    bin_idx = k
+                                    break
+                            
+                            # 如果找到对应箱且箱未满，则收集样本
+                            if bin_idx is not None and bin_idx not in completed_bins_health:
+                                if len(temp_binned_data_health[bin_idx]['data']) < samples_per_bin:
+                                    # 收集样本数据
+                                    temp_binned_data_health[bin_idx]['data'].append(batch_x[j:j+1].detach().cpu())
+                                    temp_binned_data_health[bin_idx]['temp'].append(temp)
+                                    if attention_weights is not None:
+                                        temp_binned_data_health[bin_idx]['attn'].append(attention_weights[j:j+1].detach().cpu())
+                                    if hidden_states is not None:
+                                        temp_binned_data_health[bin_idx]['features'].append(hidden_states[j:j+1].detach().cpu())
+                                    
+                                    # 检查箱是否已满
+                                    if len(temp_binned_data_health[bin_idx]['data']) >= samples_per_bin:
+                                        completed_bins_health.add(bin_idx)
+                    # 收集全局特征
+                    global_features_test_health.append(hidden_states['fused'].cpu())
+                    global_temps_test_health.extend(temps)
+                    global_hums_test_health.extend(humidity)
+                    global_labels_test_health.extend(['test_health'] * len(temps))
+
+                global_features_test_health = torch.cat(global_features_test_health, dim=0)
+                global_temps_test_health = np.array(global_temps_test_health)
+                global_hums_test_health = np.array(global_hums_test_health)
+                global_labels_test_health = np.array(global_labels_test_health)
+                # 保存全局特征
+                global_save_data = {
+                    'features': global_features_test_health,
+                    'temperature': global_temps_test_health,
+                    'humidity': global_hums_test_health,
+                    'dataset_type': 'test_health',
+                    'labels': global_labels_test_health
+                }
+                global_feature_path = os.path.join(features_save_path, 'global_test_health_features.pt')
+                torch.save(global_save_data, global_feature_path)
+
+            # 合并所有数据
+            preds = torch.cat(preds,dim = 0)
+            trues = torch.cat(trues, dim = 0)
+            losses = torch.cat(losses, dim=0)
+            labels = torch.cat(labels, dim = 0)
+            data_stamps = np.concatenate([ds.to_numpy() for ds in data_stamps])
+            timestamps = pd.Series(data_stamps.astype(int))
+            
+            # 保存结果
+            result_save(preds, trues, path_loss_save, labels, losses, timestamps, flag_one, moe_weight = moe_weights_health)
+
+            # 保存注意力权重
+            attn_save_path = os.path.join(path_loss_save, 'attention_weights')
+            os.makedirs(attn_save_path, exist_ok=True)
+            # 使用类方法保存数据
+            self.save_binned_data(temp_binned_data_health, 'test_health', temp_bins, attn_save_path)
+
+            # 处理损伤数据
+            print('>>>>>>>testing data: {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
+            path_loss_save_two = os.path.join(self.args.loss_save, setting, flag_two)
+            if not os.path.exists(path_loss_save_two):
+                os.makedirs(path_loss_save_two)
+                
+            preds_two = []
+            trues_two = []
+            masks_two = []
+            labels_two = []
+            losses_two = []
+            data_stamps_two = []
+            
+            # 初始化温度分箱数据
+            temp_binned_data_test = {i: {'data': [], 'temp': [], 'attn': [], 'features': []} for i in range(len(temp_bins))}
+            completed_bins_test = set()
+
+            # 在处理损伤数据部分添加全局特征收集变量（在preds_two变量定义附近）
+            global_features_test = []
+            global_temps_test = []
+            global_hums_test = []
+            global_labels_test = []
+
+            with torch.no_grad():
+                for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(damaged_loader):
+                    batch_x = batch_x.float().to(self.device)
+                    batch_x_mark = batch_x_mark.float().to(self.device)
+                    batch_env = batch_y.float().to(self.device)
+
+                    B, S ,T, N = batch_x.shape
+                    mask = torch.rand((B, S,T, N)).to(self.device)
+                    mask[mask <= self.args.mask_rate] = 0  # masked
+                    mask[mask > self.args.mask_rate] = 1  # remained
+
+                    # 获取输出、隐藏特征和注意力权重
+                    outputs, hidden_states, attention_weights = self.model.forward_with_attention(batch_x, batch_x_mark, None, None, mask, batch_env)
+                    moe_weights_test = None
+
+                    # f_dim = -1 if self.args.features == 'MS' else 0
+                    # outputs = outputs[:, :, f_dim:]
+
+                    # batch_x = batch_x[:, :, f_dim:]
+                    # mask = mask[:, :, f_dim:]
+                    
+                    # 计算损失和异常检测
+                    loss = criterion(outputs.reshape(B,S*T,N), batch_x.reshape(B,S*T,N))
+                    sample_labels = loss >= torch.Tensor(anomaly_threshold).to(self.device)  # 异常标签：1，正常标签：0
+
+                    # 收集常规评估数据
+                    labels_two.append(sample_labels)
+                    time_stamp = batch_y_mark
+                    data_stamp = pd.to_datetime(time_stamp[:,0].cpu().numpy(), unit='ns')
+                    masks_two.append(mask.detach().cpu())
+                    data_stamps_two.append(data_stamp)
+                    preds_two.append(outputs.reshape(B,S*T,N).detach().cpu())
+                    trues_two.append(batch_x.reshape(B,S*T,N).detach().cpu())
+                    losses_two.append(loss.detach())
+                    
+                    # 在同一次遍历中处理温度分箱
+                    if hasattr(self.args, 'use_env') and self.args.use_env:
+                        # 使用环境数据中的气温（AT，index 3）
+                        temps = batch_x_mark[:, 3].cpu().numpy()
+                        
+                        for j, temp in enumerate(temps):
+                            # 找到对应温度的箱
+                            bin_idx = None
+                            for k, (bin_min, bin_max) in enumerate(temp_bins):
+                                if bin_min <= temp < bin_max:
+                                    bin_idx = k
+                                    break
+                            
+                            # 如果找到对应箱且箱未满，则收集样本
+                            if bin_idx is not None and bin_idx not in completed_bins_test:
+                                if len(temp_binned_data_test[bin_idx]['data']) < samples_per_bin:
+                                    # 收集样本数据
+                                    temp_binned_data_test[bin_idx]['data'].append(batch_x[j:j+1].detach().cpu())
+                                    temp_binned_data_test[bin_idx]['temp'].append(temp)
+                                    if attention_weights is not None:
+                                        temp_binned_data_test[bin_idx]['attn'].append(attention_weights[j:j+1].detach().cpu())
+                                    if hidden_states is not None:
+                                        temp_binned_data_test[bin_idx]['features'].append(hidden_states[j:j+1].detach().cpu())
+                                    
+                                    # 检查箱是否已满
+                                    if len(temp_binned_data_test[bin_idx]['data']) >= samples_per_bin:
+                                        completed_bins_test.add(bin_idx)
+
+                    # 收集全局特征
+                    global_features_test.append(hidden_states['fused'].cpu())
+                    global_temps_test.extend(temps)
+                    if hasattr(batch_env, 'shape') and batch_env.shape[1] > 2:
+                        humidity = batch_env[:, 2].cpu().numpy()  # 湿度 H (索引2)
+                        global_hums_test.extend(humidity)
+                    global_labels_test.extend(['test'] * len(temps))
+
+            # 合并所有数据
+            preds_two = torch.cat(preds_two,dim = 0)
+            trues_two = torch.cat(trues_two, dim = 0)
+            losses_two = torch.cat(losses_two, dim=0)
+            labels_two = torch.cat(labels_two, dim = 0)
+            data_stamps_two = np.concatenate([ds.to_numpy() for ds in data_stamps_two])
+            timestamps_two = pd.Series(data_stamps_two.astype(int))
+            
+            # 收集全局特征
+            global_features_test = torch.cat(global_features_test, dim=0)
+            global_temps_test = np.array(global_temps_test)
+            global_hums_test = np.array(global_hums_test)
+            global_labels_test = np.array(global_labels_test)
+
+            # 保存全局特征
+            global_save_data_test = {
+                'features': global_features_test,
+                'temperature': global_temps_test,
+                'humidity': global_hums_test,
+                'dataset_type': 'test',
+                'labels': global_labels_test
+            }
+
+            features_save_path_test = os.path.join(path_loss_save_two, 'latent_features')
+            os.makedirs(features_save_path_test, exist_ok=True)
+            global_feature_path_test = os.path.join(features_save_path_test, 'global_test_features.pt')
+            torch.save(global_save_data_test, global_feature_path_test)
+
+            # 保存结果
+            result_save(preds_two, trues_two, path_loss_save_two, labels_two, losses_two, timestamps_two, flag_two, moe_weight = moe_weights_test)
+
+            # 保存注意力权重
+            attn_save_path_two = os.path.join(path_loss_save_two, 'attention_weights')
+            os.makedirs(attn_save_path_two, exist_ok=True)
+            
+            # 使用类方法保存数据
+            self.save_binned_data(temp_binned_data_test, 'test', temp_bins, attn_save_path_two)
+
+        # 在test函数结束时不再调用可视化
+        if flag_two == 'test':  # 只在处理完测试数据后执行
+            print("Test data processing completed.")
+            # 不再自动调用可视化函数
+            
+        return
+
+    def save_binned_data(self, binned_data, dataset_type, temp_bins, attn_save_path):
+        """
+        保存按温度分箱的数据（注意力权重和潜在特征）
+        
+        Args:
+            binned_data: 分箱数据字典
+            dataset_type: 数据集类型 ('train', 'vali', 'test_health', 'test')
+            temp_bins: 温度区间列表，如[(0, 5), (5, 10)]
+            attn_save_path: 注意力权重保存路径
+            features_save_path: 潜在特征保存路径
+        """
+        for bin_idx, (bin_min, bin_max) in enumerate(temp_bins):
+            if bin_idx not in binned_data or not binned_data[bin_idx]['data']:  # 跳过空箱
+                continue
+            
+            bin_data = binned_data[bin_idx]
+            
+            # 1. 保存注意力权重
+            attn_save_data = {
+                'temperature': np.array(bin_data['temp']),
+                'temp_range': (bin_min, bin_max),
+                'dataset_type': dataset_type,
+                'count': len(bin_data['data'])
+            }
+            
+            if 'attn' in bin_data and bin_data['attn']:
+                if isinstance(bin_data['attn'][0], dict):
+                    # 合并字典类型的注意力权重
+                    for attn_type in bin_data['attn'][0].keys():
+                        attn_save_data[attn_type] = torch.cat([sample[attn_type] for sample in bin_data['attn']], dim=0)
+                else:
+                    # 合并张量类型的注意力权重
+                    attn_save_data['attention'] = torch.cat(bin_data['attn'], dim=0)
+                
+            attn_file_path = os.path.join(attn_save_path, f'attn_temp_{bin_min}_{bin_max}_{dataset_type}.pt')
+            torch.save(attn_save_data, attn_file_path)
+            
+            # # 2. 保存潜空间特征
+            # features_save_data = {
+            #     'features': torch.cat(bin_data['features'], dim=0),
+            #     'temperature': np.array(bin_data['temp']),
+            #     'dataset_type': dataset_type,
+            #     'temp_range': (bin_min, bin_max)
+            # }
+            
+            # # 添加其他环境变量（如果存在）
+            # for env_var in ['humidity', 'wind_speed', 'wind_direction', 'thermal_exp']:
+            #     if env_var in bin_data and bin_data[env_var]:
+            #         features_save_data[env_var] = np.array(bin_data[env_var])
+            
+            # feature_dir = os.path.join(features_save_path, f'latent_features_temp_{bin_min}_{bin_max}')
+            # os.makedirs(feature_dir, exist_ok=True)
+            # feature_file_path = os.path.join(feature_dir, f'{dataset_type}_features.pt')
+            # torch.save(features_save_data, feature_file_path)
+            
+            print(f"Saved {len(bin_data['data'])} samples for temp range {bin_min}°C-{bin_max}°C ({dataset_type})")
